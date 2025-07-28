@@ -122,6 +122,42 @@ if selected_muni:
 
     # Result table
     results = []
+
+
+# -------------------- CALCULATE POPULATION VARIATION FOR EACH YEAR --------------------
+    pop_variation_dict = {}
+
+    try:
+        hist_df_raw = pd.read_parquet("population/poblacion_completa.parquet")
+        hist_df_raw.rename(columns={hist_df_raw.columns[0]: "municipio"}, inplace=True)
+        hist_row = hist_df_raw[hist_df_raw["municipio"].str.contains(selected_muni, case=False, na=False)]
+
+        if not hist_row.empty:
+            hist_row = hist_row.iloc[0]
+
+            def clean_series(series):
+                return pd.to_numeric(series.replace(r"^\s*$", pd.NA, regex=True), errors="coerce")
+
+            pop_t = clean_series(hist_row.filter(like="_t")).dropna()
+            pop_years = [int(col.split("_")[0]) for col in pop_t.index]
+            pop_series = pd.Series(pop_t.values, index=pop_years).sort_index()
+
+            for year in YEARS:
+                y = int(year)
+                if y in pop_series.index and (y - 10) in pop_series.index:
+                    base = pop_series[y - 10]
+                    current = pop_series[y]
+                    pct = round((current - base) / base * 100, 2) if base else None
+                    pop_variation_dict[year] = pct
+                else:
+                    pop_variation_dict[year] = None
+    except:
+        for year in YEARS:
+            pop_variation_dict[year] = None
+
+
+
+
     for year in YEARS:
         total = pop_df.get(f"total_total_total_{year}", pd.Series([0])).values[0]
         over_65 = pop_df[[f"total_{age}_total_{year}" for age in age_65_plus if f"total_{age}_total_{year}" in pop_df.columns]].sum(axis=1).values[0]
@@ -132,6 +168,7 @@ if selected_muni:
 
         row = {
             "Año": year,
+            "Variación Poblacional Últimos 10 años (%)": pop_variation_dict.get(year),
             "D.22.a. Envejecimiento (%)": round(over_65 / total * 100, 2) if total else None,
             "D.22.b. Senectud (%)": round(over_85 / over_65 * 100, 2) if over_65 else None,
             "Población extranjera (%)": round(foreign / total * 100, 2) if total else None,
@@ -166,9 +203,8 @@ if selected_muni:
 
     # -------------------- HISTORICAL POPULATION GRAPH --------------------
     try:
-        hist_df_raw = pd.read_parquet("soriaPop.parquet")
+        hist_df_raw = pd.read_parquet("population/poblacion_completa.parquet")
         hist_df_raw.rename(columns={hist_df_raw.columns[0]: "municipio"}, inplace=True)
-
         hist_row = hist_df_raw[hist_df_raw["municipio"].str.contains(selected_muni, case=False, na=False)]
         if not hist_row.empty:
             hist_row = hist_row.iloc[0]
