@@ -314,6 +314,34 @@ def load_internal_base():
     except Exception as e:
         st.error(f"❌ Error cargando capa base interna: {e}")
         return None
+    
+
+
+from pathlib import Path
+
+@st.cache_data
+def load_municipio_geojson_by_code(municipio, df):
+    """Carga GeoJSON usando el código INE del municipio"""
+    try:
+        code_ine = df[df["municipio"] == municipio]["municipio"].astype(str).str.zfill(5).values[0]
+    except IndexError:
+        st.warning(f"No se encontró código INE para el municipio '{municipio}'")
+        return None
+
+    # Buscar el archivo que empieza por ese código
+    folder = Path("geojson_municipios")
+    matching_files = list(folder.glob(f"{code_ine}*.geojson"))
+
+    if not matching_files:
+        st.warning(f"⚠️ No se encontró un GeoJSON para el código INE {code_ine}")
+        return None
+
+    try:
+        return gpd.read_file(matching_files[0])
+    except Exception as e:
+        st.warning(f"⚠️ Error leyendo GeoJSON de {municipio}: {e}")
+        return None
+
 # -------------------- MAIN APP --------------------
 st.title("📊 Indicadores INE por Municipio")
 
@@ -632,10 +660,34 @@ with tab1:
                 st.metric("Población Total 2024", f"{total_pop_2024:,}" if total_pop_2024 else "No disponible")
             except:
                 pass
+            # Mostrar mapa del municipio seleccionado
+            st.markdown("### 🗺️ Mapa del Municipio Seleccionado")
+
+            gdf_muni = load_municipio_geojson_by_code(selected_muni, df)
+
+            if gdf_muni is not None:
+                map_muni = create_folium_map(gdf_muni, f"Municipio: {selected_muni}")
+                st_folium(map_muni, width=700, height=400)
+            else:
+                st.warning("⚠️ No se pudo cargar el mapa del municipio.")
+
 
     if selected_muni:
         st.markdown("---")
         pop_df = df[df["municipio"] == selected_muni]
+        with st.spinner("🔍 Procesando capa geográfica del municipio..."):
+            gdf_muni = load_municipio_geojson_by_code(selected_muni, df)
+            gdf_base = load_internal_base()
+        
+            if gdf_muni is not None:
+                result = perform_spatial_clip(gdf_base, gdf_muni)
+                if result is not None and not result.empty:
+                    st.session_state["sup_cultivos"] = result["estal"].sum()
+                else:
+                    st.warning("⚠️ El recorte no devolvió resultados.")
+            else:
+                st.info("ℹ️ No se encontró geometría para este municipio o falló la carga.")
+
         if pop_df.empty:
             st.error("❌ No se encontraron datos para el municipio seleccionado.")
             st.stop()
@@ -769,6 +821,7 @@ with tab1:
         results_df = pd.DataFrame(results)
         st.markdown(f"### 📈 Indicadores para **{selected_muni}**")
         st.dataframe(results_df, use_container_width=True, hide_index=True)
+        
 
         # -------------------- HISTORICAL POPULATION GRAPH --------------------
         try:
