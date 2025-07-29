@@ -1,3 +1,4 @@
+
 import pandas as pd
 import streamlit as st
 import io
@@ -12,8 +13,8 @@ import matplotlib.pyplot as plt
 
 # -------------------- PAGE CONFIG --------------------
 st.set_page_config(
-    page_title="📊 Indicadores INE por Municipio",
-    page_icon="📊",
+    page_title="Indicadores INE por Municipio",
+    page_icon="🌆",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -117,27 +118,37 @@ def create_folium_map(gdf, map_title="Mapa"):
             'weight': 2,
             'fillOpacity': 0.3,
         },
-        popup=folium.GeoJsonPopup(fields=list(gdf_web.columns[:-1]))  # Exclude geometry
+        popup=folium.GeoJsonPopup(
+            fields=[col for col in gdf_web.columns if col != 'geometry']
+        )
+
     ).add_to(m)
     
     return m
 
 def perform_spatial_clip(gdf_data, gdf_clip):
-    """Perform spatial clipping operation"""
+    """Perform spatial clipping operation and recalculate area"""
     try:
-        # Ensure both GeoDataFrames have the same CRS
+        # Reproject to match
         if gdf_data.crs != gdf_clip.crs:
             st.info(f"🔄 Reproyectando datos de {gdf_data.crs} a {gdf_clip.crs}")
             gdf_data = gdf_data.to_crs(gdf_clip.crs)
-        
-        # Perform the clip
+
+        # Perform clip
         clipped_gdf = gpd.clip(gdf_data, gdf_clip)
-        
+
+        # Recalculate area in m² using EPSG:25830
+        clipped_area = clipped_gdf.to_crs(epsg=25830)
+        clipped_gdf["estal"] = [a / 10000 for a in calculate_ellipsoidal_area(clipped_gdf)]
+        # Make sure 'geometry' column is active and valid
+        clipped_gdf.set_geometry("geometry", inplace=True)
+
         return clipped_gdf
-        
+
     except Exception as e:
         st.error(f"❌ Error en operación de recorte: {str(e)}")
         return None
+
 
 def export_geodata(gdf, filename_base, format_type):
     """Export GeoDataFrame to different formats"""
@@ -253,6 +264,26 @@ def process_uploaded_file(uploaded_file):
     except Exception as e:
         st.error(f"❌ Error al procesar el archivo: {str(e)}")
         return None
+from pyproj import Geod
+
+def calculate_ellipsoidal_area(gdf):
+    """Calculate ellipsoidal area (like QGIS $area) in m² using WGS84"""
+    geod = Geod(ellps="WGS84")
+
+    areas = []
+    for geom in gdf.geometry:
+        if geom is None or geom.is_empty:
+            areas.append(0)
+        else:
+            if geom.geom_type == "Polygon":
+                area, _ = geod.geometry_area_perimeter(geom)
+            elif geom.geom_type == "MultiPolygon":
+                area = sum(geod.geometry_area_perimeter(p)[0] for p in geom.geoms)
+            else:
+                area = 0
+            areas.append(abs(area))  # Ensure positive
+
+    return areas
 
 # -------------------- LOAD DATASETS --------------------
 @st.cache_data
@@ -271,11 +302,96 @@ def load_data():
         st.error(f"❌ No se pudieron cargar los archivos Parquet: {e}")
         return None, None, None, None, None, None
 
+@st.cache_data
+def load_internal_base():
+    """Load heavy base layer (optimized)"""
+    try:
+        # Load the lightweight version (FlatGeobuf recommended)
+        gdf = gpd.read_file("siose/codigo09.geojson")  # or .parquet
+        if "SIOSE_XML" in gdf.columns:
+            gdf = gdf.drop(columns=["SIOSE_XML"])
+        return gdf
+    except Exception as e:
+        st.error(f"❌ Error cargando capa base interna: {e}")
+        return None
 # -------------------- MAIN APP --------------------
 st.title("📊 Indicadores INE por Municipio")
 
 # Add tabs for different functionalities
-tab1, tab2, tab3 = st.tabs(["📈 Análisis INE", "📁 Subir Archivo", "🗺️ Análisis Geoespacial"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📈 Análisis INE", 
+    "📁 Subir Archivo", 
+    "🗺️ Análisis Geoespacial", 
+    "🧩 Recorte con Base Interna"
+])
+
+with tab4:
+    st.header("🧩 Recorte con Base Interna")
+    st.markdown("Recorta una máscara sobre una capa interna precargada (Castilla y León)")
+
+    with st.spinner("Cargando capa base interna..."):
+        gdf_base = load_internal_base()
+
+    if gdf_base is not None:
+        display_geodata_info(gdf_base, "Capa Base Interna")
+
+        # Upload mask
+        st.markdown("### ✂️ Subir Máscara de Recorte")
+        mask_file = st.file_uploader(
+            "Selecciona una máscara (GeoJSON o Shapefile ZIP)",
+            type=['geojson', 'zip'],
+            key="internal_clip_upload"
+        )
+
+        if mask_file:
+            with st.spinner("Procesando máscara..."):
+                gdf_mask = (
+                    process_shapefile(mask_file)
+                    if mask_file.name.endswith('.zip')
+                    else process_geojson(mask_file)
+                )
+
+            if gdf_mask is not None:
+                display_geodata_info(gdf_mask, mask_file.name)
+
+                # Clip button
+                if st.button("🔪 Recortar Base con Máscara"):
+                    with st.spinner("Recortando..."):
+                        result = perform_spatial_clip(gdf_base, gdf_mask)
+
+                    if result is not None and not result.empty:
+                        st.session_state["clipped_result"] = result
+
+                        total_estal = result["estal"].sum()
+                        st.session_state["sup_cultivos"] = total_estal  # 💾 Guardar en sesión
+                        st.success(f"🌿 Superficie de cultivos (código 09): {total_estal} ha")
+                        
+
+                        geojson_data, geojson_fn, geojson_mime = export_geodata(result, "recorte_interno", "GeoJSON")
+                        shapefile_data, shapefile_fn, shapefile_mime = export_geodata(result, "recorte_interno", "Shapefile")
+                        csv_data, csv_fn, csv_mime = export_geodata(result, "recorte_interno", "CSV")
+
+                        # Store in session state
+                        st.session_state["exports"] = {
+                            "geojson": (geojson_data, geojson_fn, geojson_mime),
+                            "shapefile": (shapefile_data, shapefile_fn, shapefile_mime),
+                            "csv": (csv_data, csv_fn, csv_mime),
+                        }
+                        if "exports" in st.session_state:
+                            exports = st.session_state["exports"]
+
+                            st.subheader("💾 Descargar Resultado")
+                            col1, col2, col3 = st.columns(3)
+
+                            with col1:
+                                st.download_button("⬇️ GeoJSON", *exports["geojson"])
+
+                            with col2:
+                                st.download_button("⬇️ Shapefile (ZIP)", *exports["shapefile"])
+
+                            with col3:
+                                st.download_button("⬇️ CSV", *exports["csv"])
+
 
 with tab2:
     st.header("📁 Cargar y Analizar Archivo")
@@ -599,6 +715,8 @@ with tab1:
                         pop_variation_dict[year] = pct
                     else:
                         pop_variation_dict[year] = None
+                    
+
         except:
             for year in YEARS:
                 pop_variation_dict[year] = None
@@ -630,6 +748,12 @@ with tab1:
                 "D.18.c. % Motocicletas": pct_motos if year == "2023" else None
             }
 
+            if "sup_cultivos" in st.session_state and total:
+                verde_1000hab = round(st.session_state["sup_cultivos"] / (total / 1000), 2)
+                row["SUPERFICIE VERDE (ha cada 1.000 hab)"] = verde_1000hab
+            else:
+                row["SUPERFICIE VERDE (ha cada 1.000 hab)"] = None
+        
             if year == "2021":
                 try:
                     v_total = censo_df["viviendasT"].values[0]
