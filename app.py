@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from sqlalchemy import create_engine
 
+
 # -------------------- PAGE CONFIG --------------------
 st.set_page_config(
     page_title="Indicadores INE por Municipio",
