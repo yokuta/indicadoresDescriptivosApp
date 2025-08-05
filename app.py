@@ -1,4 +1,3 @@
-
 import pandas as pd
 import streamlit as st
 import io
@@ -10,6 +9,8 @@ import tempfile
 import os
 from shapely.geometry import Point, Polygon
 import matplotlib.pyplot as plt
+import streamlit as st
+from sqlalchemy import create_engine
 
 # -------------------- PAGE CONFIG --------------------
 st.set_page_config(
@@ -18,6 +19,18 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+# -------------------- DATABASE CONNECTION --------------------
+@st.cache_resource
+def get_db_connection():
+    """Create database connection"""
+    try:
+        db_url = st.secrets["postgres"]["db_url"]
+        engine = create_engine(db_url)
+        return engine
+    except Exception as e:
+        st.error(f"❌ Error conectando a la base de datos: {e}")
+        st.stop()
 
 # -------------------- GEOSPATIAL FUNCTIONS --------------------
 def process_shapefile(uploaded_file):
@@ -59,7 +72,7 @@ def process_geojson(uploaded_file):
 
 def display_geodata_info(gdf, filename):
     """Display information about the GeoDataFrame"""
-    st.success(f"✅ Archivo geoespacial cargado: **{filename}**")
+    st.success(f"✅ Datos geoespaciales cargados: **{filename}**")
     
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -72,10 +85,16 @@ def display_geodata_info(gdf, filename):
         geom_types = gdf.geometry.geom_type.unique()
         st.metric("Tipo geometría", ", ".join(geom_types))
     
-    # Show attribute table
+    # Show attribute table - remove ALL geometry-related columns
     st.subheader("📋 Tabla de Atributos")
-    # Remove geometry column for display
-    display_df = gdf.drop(columns=['geometry']) if 'geometry' in gdf.columns else gdf
+    display_df = gdf.copy()
+    
+    # Remove all potential geometry columns
+    geom_cols_to_remove = ['geometry', 'geom', 'geom_wkt']
+    for col in geom_cols_to_remove:
+        if col in display_df.columns:
+            display_df = display_df.drop(columns=[col])
+    
     st.dataframe(display_df.head(10), use_container_width=True)
     
     # Show bounds
@@ -129,26 +148,34 @@ def create_folium_map(gdf, map_title="Mapa"):
 def perform_spatial_clip(gdf_data, gdf_clip):
     """Perform spatial clipping operation and recalculate area"""
     try:
+        # Ensure both GDFs have valid CRS
+        if gdf_data.crs is None:
+            gdf_data.set_crs("EPSG:25830", inplace=True)
+        if gdf_clip.crs is None:
+            gdf_clip.set_crs("EPSG:25830", inplace=True)
+            
         # Reproject to match
         if gdf_data.crs != gdf_clip.crs:
-            st.info(f"🔄 Reproyectando datos de {gdf_data.crs} a {gdf_clip.crs}")
             gdf_data = gdf_data.to_crs(gdf_clip.crs)
 
         # Perform clip
         clipped_gdf = gpd.clip(gdf_data, gdf_clip)
 
-        # Recalculate area in m² using EPSG:25830
-        clipped_area = clipped_gdf.to_crs(epsg=25830)
-        clipped_gdf["estal"] = [a / 10000 for a in calculate_ellipsoidal_area(clipped_gdf)]
-        # Make sure 'geometry' column is active and valid
-        clipped_gdf.set_geometry("geometry", inplace=True)
+        if clipped_gdf.empty:
+            return None
+
+        # Recalculate area using WGS84 (like your working code)
+        clipped_wgs84 = clipped_gdf.to_crs(epsg=4326)
+        area_m2 = calculate_ellipsoidal_area(clipped_wgs84)
+        clipped_gdf["area_m2"] = area_m2
+        clipped_gdf["area_ha"] = [a / 10000 for a in area_m2]
+        clipped_gdf["estal"] = clipped_gdf["area_ha"]  # Keep compatibility with your code
 
         return clipped_gdf
 
     except Exception as e:
         st.error(f"❌ Error en operación de recorte: {str(e)}")
         return None
-
 
 def export_geodata(gdf, filename_base, format_type):
     """Export GeoDataFrame to different formats"""
@@ -185,6 +212,7 @@ def export_geodata(gdf, filename_base, format_type):
     except Exception as e:
         st.error(f"❌ Error exportando datos: {str(e)}")
         return None, None, None
+
 def display_file_info(uploaded_file, df):
     """Display information about the uploaded file"""
     st.success(f"✅ Archivo cargado: **{uploaded_file.name}**")
@@ -264,6 +292,7 @@ def process_uploaded_file(uploaded_file):
     except Exception as e:
         st.error(f"❌ Error al procesar el archivo: {str(e)}")
         return None
+
 from pyproj import Geod
 
 def calculate_ellipsoidal_area(gdf):
@@ -303,18 +332,36 @@ def load_data():
         return None, None, None, None, None, None
 
 @st.cache_data
-def load_internal_base():
-    """Load heavy base layer (optimized)"""
+def load_internal_bases(selected_muni):
+    """Carga las capas internas desde una sola tabla, filtrando por municipio y CODSIU"""
     try:
-        # Load the lightweight version (FlatGeobuf recommended)
-        gdf = gpd.read_file("siose/codigo09.geojson")  # or .parquet
-        if "SIOSE_XML" in gdf.columns:
-            gdf = gdf.drop(columns=["SIOSE_XML"])
-        return gdf
+        engine = get_db_connection()
+        query = """
+            SELECT * 
+            FROM dev_codeine.siu_siose_with_municipalities
+            WHERE municipality ILIKE %(municipality)s
+              AND "CODSIU" = %(codsiu)s
+        """
+        with engine.connect() as conn:
+            gdf_09 = gpd.read_postgis(query, conn, geom_col="geom", params={
+                "municipality": f"%{selected_muni}%",
+                "codsiu": 9
+            })
+            gdf_14 = gpd.read_postgis(query, conn, geom_col="geom", params={
+                "municipality": f"%{selected_muni}%",
+                "codsiu": 14
+            })
+            gdf_12 = gpd.read_postgis(query, conn, geom_col="geom", params={
+                "municipality": f"%{selected_muni}%",
+                "codsiu": 12
+            })
+
+        return gdf_09, gdf_14, gdf_12
+
     except Exception as e:
-        st.error(f"❌ Error cargando capa base interna: {e}")
-        return None
-    
+        st.error(f"❌ Error cargando capas base desde PostgreSQL: {e}")
+        return None, None, None
+
 
 
 from pathlib import Path
@@ -346,275 +393,9 @@ def load_municipio_geojson_by_code(municipio, df):
 st.title("📊 Indicadores INE por Municipio")
 
 # Add tabs for different functionalities
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📈 Análisis INE", 
-    "📁 Subir Archivo", 
-    "🗺️ Análisis Geoespacial", 
-    "🧩 Recorte con Base Interna"
-])
+# Only one tab: Análisis INE
+tab1 = st.container()
 
-with tab4:
-    st.header("🧩 Recorte con Base Interna")
-    st.markdown("Recorta una máscara sobre una capa interna precargada (Castilla y León)")
-
-    with st.spinner("Cargando capa base interna..."):
-        gdf_base = load_internal_base()
-
-    if gdf_base is not None:
-        display_geodata_info(gdf_base, "Capa Base Interna")
-
-        # Upload mask
-        st.markdown("### ✂️ Subir Máscara de Recorte")
-        mask_file = st.file_uploader(
-            "Selecciona una máscara (GeoJSON o Shapefile ZIP)",
-            type=['geojson', 'zip'],
-            key="internal_clip_upload"
-        )
-
-        if mask_file:
-            with st.spinner("Procesando máscara..."):
-                gdf_mask = (
-                    process_shapefile(mask_file)
-                    if mask_file.name.endswith('.zip')
-                    else process_geojson(mask_file)
-                )
-
-            if gdf_mask is not None:
-                display_geodata_info(gdf_mask, mask_file.name)
-
-                # Clip button
-                if st.button("🔪 Recortar Base con Máscara"):
-                    with st.spinner("Recortando..."):
-                        result = perform_spatial_clip(gdf_base, gdf_mask)
-
-                    if result is not None and not result.empty:
-                        st.session_state["clipped_result"] = result
-
-                        total_estal = result["estal"].sum()
-                        st.session_state["sup_cultivos"] = total_estal  # 💾 Guardar en sesión
-                        st.success(f"🌿 Superficie de cultivos (código 09): {total_estal} ha")
-                        
-
-                        geojson_data, geojson_fn, geojson_mime = export_geodata(result, "recorte_interno", "GeoJSON")
-                        shapefile_data, shapefile_fn, shapefile_mime = export_geodata(result, "recorte_interno", "Shapefile")
-                        csv_data, csv_fn, csv_mime = export_geodata(result, "recorte_interno", "CSV")
-
-                        # Store in session state
-                        st.session_state["exports"] = {
-                            "geojson": (geojson_data, geojson_fn, geojson_mime),
-                            "shapefile": (shapefile_data, shapefile_fn, shapefile_mime),
-                            "csv": (csv_data, csv_fn, csv_mime),
-                        }
-                        if "exports" in st.session_state:
-                            exports = st.session_state["exports"]
-
-                            st.subheader("💾 Descargar Resultado")
-                            col1, col2, col3 = st.columns(3)
-
-                            with col1:
-                                st.download_button("⬇️ GeoJSON", *exports["geojson"])
-
-                            with col2:
-                                st.download_button("⬇️ Shapefile (ZIP)", *exports["shapefile"])
-
-                            with col3:
-                                st.download_button("⬇️ CSV", *exports["csv"])
-
-
-with tab2:
-    st.header("📁 Cargar y Analizar Archivo")
-    st.markdown("Sube tu archivo CSV, Excel, JSON o Parquet para analizarlo:")
-    
-    uploaded_file = st.file_uploader(
-        "Selecciona un archivo",
-        type=['csv', 'xlsx', 'xls', 'json', 'parquet'],
-        help="Formatos soportados: CSV, Excel (.xlsx, .xls), JSON, Parquet"
-    )
-    
-    if uploaded_file is not None:
-        with st.spinner('Procesando archivo...'):
-            df_uploaded = process_uploaded_file(uploaded_file)
-            
-        if df_uploaded is not None:
-            display_file_info(uploaded_file, df_uploaded)
-            
-            # Option to download processed data
-            st.markdown("---")
-            st.subheader("💾 Descargar Datos Procesados")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                csv_data = df_uploaded.to_csv(index=False)
-                st.download_button(
-                    "📥 Descargar como CSV",
-                    csv_data,
-                    f"processed_{uploaded_file.name.split('.')[0]}.csv",
-                    "text/csv"
-                )
-            
-            with col2:
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    df_uploaded.to_excel(writer, index=False, sheet_name="Data")
-                st.download_button(
-                    "📊 Descargar como Excel",
-                    buffer.getvalue(),
-                    f"processed_{uploaded_file.name.split('.')[0]}.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-with tab3:
-    st.header("🗺️ Análisis Geoespacial")
-    st.markdown("Sube archivos geoespaciales y realiza operaciones de recorte espacial:")
-    
-    # Initialize session state for geodata
-    if 'gdf_data' not in st.session_state:
-        st.session_state.gdf_data = None
-    if 'gdf_clip' not in st.session_state:
-        st.session_state.gdf_clip = None
-    if 'clipped_result' not in st.session_state:
-        st.session_state.clipped_result = None
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📊 Archivo de Datos (para recortar)")
-        st.markdown("Sube el archivo que quieres recortar (ej: datos de España)")
-        
-        data_file = st.file_uploader(
-            "Selecciona archivo de datos",
-            type=['geojson', 'zip'],
-            help="Formatos: GeoJSON (.geojson) o Shapefile (.zip)",
-            key="data_upload"
-        )
-        
-        if data_file is not None:
-            with st.spinner('Procesando archivo de datos...'):
-                if data_file.name.endswith('.zip'):
-                    gdf_data = process_shapefile(data_file)
-                else:
-                    gdf_data = process_geojson(data_file)
-                
-                if gdf_data is not None:
-                    st.session_state.gdf_data = gdf_data
-                    display_geodata_info(gdf_data, data_file.name)
-                    
-                    # Show map
-                    st.subheader("🗺️ Vista del Dataset")
-                    map_data = create_folium_map(gdf_data, "Datos a Recortar")
-                    st_folium(map_data, width=400, height=300)
-    
-    with col2:
-        st.subheader("✂️ Archivo de Recorte (máscara)")
-        st.markdown("Sube el archivo que usarás como máscara (ej: municipio de Murcia)")
-        
-        clip_file = st.file_uploader(
-            "Selecciona archivo de recorte",
-            type=['geojson', 'zip'],
-            help="Formatos: GeoJSON (.geojson) o Shapefile (.zip)",
-            key="clip_upload"
-        )
-        
-        if clip_file is not None:
-            with st.spinner('Procesando archivo de recorte...'):
-                if clip_file.name.endswith('.zip'):
-                    gdf_clip = process_shapefile(clip_file)
-                else:
-                    gdf_clip = process_geojson(clip_file)
-                
-                if gdf_clip is not None:
-                    st.session_state.gdf_clip = gdf_clip
-                    display_geodata_info(gdf_clip, clip_file.name)
-                    
-                    # Show map
-                    st.subheader("🗺️ Vista de la Máscara")
-                    map_clip = create_folium_map(gdf_clip, "Máscara de Recorte")
-                    st_folium(map_clip, width=400, height=300)
-    
-    # Clipping operation
-    if st.session_state.gdf_data is not None and st.session_state.gdf_clip is not None:
-        st.markdown("---")
-        st.subheader("✂️ Operación de Recorte Espacial")
-        
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            if st.button("🔥 Realizar Recorte", type="primary"):
-                with st.spinner('Realizando recorte espacial...'):
-                    clipped_gdf = perform_spatial_clip(st.session_state.gdf_data, st.session_state.gdf_clip)
-                    
-                    if clipped_gdf is not None:
-                        st.session_state.clipped_result = clipped_gdf
-                        st.success(f"✅ Recorte completado! {len(clipped_gdf)} geometrías resultantes")
-        
-        with col2:
-            if st.session_state.clipped_result is not None:
-                st.info(f"**Geometrías antes del recorte:** {len(st.session_state.gdf_data)}")
-                st.info(f"**Geometrías después del recorte:** {len(st.session_state.clipped_result)}")
-    
-    # Show results
-    if st.session_state.clipped_result is not None:
-        st.markdown("---")
-        st.subheader("📊 Resultado del Recorte")
-        
-        clipped_gdf = st.session_state.clipped_result
-        
-        # Show info about result
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Geometrías Resultantes", len(clipped_gdf))
-        with col2:
-            st.metric("Columnas", len(clipped_gdf.columns))
-        with col3:
-            st.metric("CRS", str(clipped_gdf.crs) if clipped_gdf.crs else "No definido")
-        
-        # Show attribute table
-        st.subheader("📋 Tabla de Atributos del Resultado")
-        display_df = clipped_gdf.drop(columns=['geometry']) if 'geometry' in clipped_gdf.columns else clipped_gdf
-        st.dataframe(display_df, use_container_width=True)
-        
-        # Show map of result
-        st.subheader("🗺️ Mapa del Resultado")
-        result_map = create_folium_map(clipped_gdf, "Resultado del Recorte")
-        st_folium(result_map, width=700, height=400)
-        
-        # Export options
-        st.markdown("---")
-        st.subheader("💾 Descargar Resultado")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("📥 Descargar GeoJSON"):
-                data, filename, mime = export_geodata(clipped_gdf, "recorte_resultado", "GeoJSON")
-                if data:
-                    st.download_button(
-                        "⬇️ GeoJSON",
-                        data,
-                        filename,
-                        mime
-                    )
-        
-        with col2:
-            if st.button("📦 Descargar Shapefile"):
-                data, filename, mime = export_geodata(clipped_gdf, "recorte_resultado", "Shapefile")
-                if data:
-                    st.download_button(
-                        "⬇️ Shapefile (ZIP)",
-                        data,
-                        filename,
-                        mime
-                    )
-        
-        with col3:
-            if st.button("📄 Descargar CSV"):
-                data, filename, mime = export_geodata(clipped_gdf, "recorte_resultado", "CSV")
-                if data:
-                    st.download_button(
-                        "⬇️ Tabla CSV",
-                        data,
-                        filename,
-                        mime
-                    )
 
 with tab1:
     st.markdown("---")
@@ -660,31 +441,38 @@ with tab1:
                 st.metric("Población Total 2024", f"{total_pop_2024:,}" if total_pop_2024 else "No disponible")
             except:
                 pass
-            # Mostrar mapa del municipio seleccionado
-            st.markdown("### 🗺️ Mapa del Municipio Seleccionado")
-
-            gdf_muni = load_municipio_geojson_by_code(selected_muni, df)
-
-            if gdf_muni is not None:
-                map_muni = create_folium_map(gdf_muni, f"Municipio: {selected_muni}")
-                st_folium(map_muni, width=700, height=400)
-            else:
-                st.warning("⚠️ No se pudo cargar el mapa del municipio.")
-
 
     if selected_muni:
         st.markdown("---")
         pop_df = df[df["municipio"] == selected_muni]
         with st.spinner("🔍 Procesando capa geográfica del municipio..."):
             gdf_muni = load_municipio_geojson_by_code(selected_muni, df)
-            gdf_base = load_internal_base()
-        
+            gdf_base_09, gdf_base_14, gdf_base_12 = load_internal_bases(selected_muni)
+
             if gdf_muni is not None:
-                result = perform_spatial_clip(gdf_base, gdf_muni)
-                if result is not None and not result.empty:
-                    st.session_state["sup_cultivos"] = result["estal"].sum()
+                # Recorte código09
+                result_09 = perform_spatial_clip(gdf_base_09, gdf_muni)
+                if result_09 is not None and not result_09.empty:
+                    st.session_state["sup_cultivos"] = result_09["estal"].sum()
                 else:
-                    st.warning("⚠️ El recorte no devolvió resultados.")
+                    st.warning("⚠️ El recorte de código 09 no devolvió resultados.")
+                    st.session_state["sup_cultivos"] = None
+            
+                # Recorte código14
+                result_14 = perform_spatial_clip(gdf_base_14, gdf_muni)
+                if result_14 is not None and not result_14.empty:
+                    st.session_state["sup_cultivos_14"] = result_14["estal"].sum()
+                else:
+                    st.warning("⚠️ El recorte de código 14 no devolvió resultados.")
+                    st.session_state["sup_cultivos_14"] = None
+                # Recorte código12
+                result_12 = perform_spatial_clip(gdf_base_12, gdf_muni)
+                if result_12 is not None and not result_12.empty:
+                    st.session_state["sup_cultivos_12"] = result_12["estal"].sum()
+                else:
+                    st.warning("⚠️ El recorte de código 12 no devolvió resultados.")
+                    st.session_state["sup_cultivos_12"] = None
+
             else:
                 st.info("ℹ️ No se encontró geometría para este municipio o falló la carga.")
 
@@ -800,12 +588,56 @@ with tab1:
                 "D.18.c. % Motocicletas": pct_motos if year == "2023" else None
             }
 
-            if "sup_cultivos" in st.session_state and total:
+            if "sup_cultivos" in st.session_state and st.session_state["sup_cultivos"] is not None and total:
                 verde_1000hab = round(st.session_state["sup_cultivos"] / (total / 1000), 2)
                 row["SUPERFICIE VERDE (ha cada 1.000 hab)"] = verde_1000hab
             else:
                 row["SUPERFICIE VERDE (ha cada 1.000 hab)"] = None
-        
+
+            # Indicador nuevo: Superficie cultivos código14 / superficie municipio
+            try:
+                if (
+                    "sup_cultivos_14" in st.session_state and 
+                    st.session_state["sup_cultivos_14"] is not None and
+                    gdf_muni is not None and 
+                    not gdf_muni.empty
+                ):
+                    muni_area_ha = sum(calculate_ellipsoidal_area(gdf_muni)) / 10000  # ha
+                    if muni_area_ha > 0:
+                        sup14_pct = round((st.session_state["sup_cultivos_14"] / muni_area_ha) * 100, 2)
+                        row["% Cultivos Código 14 / Sup. Municipio"] = sup14_pct
+                    else:
+                        row["% Cultivos Código 14 / Sup. Municipio"] = None
+                else:
+                    row["% Cultivos Código 14 / Sup. Municipio"] = None
+            except:
+                row["% Cultivos Código 14 / Sup. Municipio"] = None
+
+            # Indicadores para código 12
+            try:
+                if (
+                    "sup_cultivos_12" in st.session_state and 
+                    st.session_state["sup_cultivos_12"] is not None and
+                    gdf_muni is not None and 
+                    not gdf_muni.empty
+                ):
+                    # Indicador 1: solo la superficie
+                    row["Superficie Cultivos (cod: 12) ha"] = round(st.session_state["sup_cultivos_12"], 2)
+            
+                    # Indicador 2: porcentaje sobre sup. municipal
+                    muni_area_ha = sum(calculate_ellipsoidal_area(gdf_muni)) / 10000  # ha
+                    if muni_area_ha > 0:
+                        pct12 = round((st.session_state["sup_cultivos_12"] / muni_area_ha) * 100, 2)
+                        row["% Cultivos Código 12 / Sup. Municipio"] = pct12
+                    else:
+                        row["% Cultivos Código 12 / Sup. Municipio"] = None
+                else:
+                    row["Superficie Cultivos (cod: 12) ha"] = None
+                    row["% Cultivos Código 12 / Sup. Municipio"] = None
+            except:
+                row["Superficie Cultivos (cod: 12) ha"] = None
+                row["% Cultivos Código 12 / Sup. Municipio"] = None
+            
             if year == "2021":
                 try:
                     v_total = censo_df["viviendasT"].values[0]
@@ -819,10 +651,27 @@ with tab1:
             results.append(row)
 
         results_df = pd.DataFrame(results)
-        st.markdown(f"### 📈 Indicadores para **{selected_muni}**")
-        st.dataframe(results_df, use_container_width=True, hide_index=True)
-        
 
+        st.markdown(f"### 📈 Indicadores para **{selected_muni}**")
+
+        # Wider table, narrow map, with spacing to push the map to the right
+        col1, spacer, col2 = st.columns([3.5, 0.1, 0.8])
+        
+        with col1:
+            if not results_df.empty:
+                st.dataframe(results_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay datos disponibles para mostrar.")
+
+        with col2:
+            show_map = st.toggle("🗺️ Mostrar/Ocultar Mapa del Municipio", value=False)
+
+        if selected_muni and gdf_muni is not None and show_map:
+            st.markdown("### 🗺️ Mapa del Municipio")
+            map_muni = create_folium_map(gdf_muni, f"Municipio: {selected_muni}")
+            st_folium(map_muni, width=700, height=500, key="map_municipio_expandido")
+
+        
         # -------------------- HISTORICAL POPULATION GRAPH --------------------
         try:
             hist_df_raw = pd.read_parquet("population/poblacion_completa.parquet")
